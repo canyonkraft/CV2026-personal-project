@@ -27,6 +27,7 @@ numpy>=1.24.0
 scipy>=1.11.0        # required by FID internally
 requests>=2.31.0
 tqdm>=4.66.0
+matplotlib>=3.7.0    # for chart generation
 
 # ── Optional: xformers for memory-efficient attention (GPU only) ──────────────
 # xformers>=0.0.23

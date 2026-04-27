@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import os
+import csv
 import json
 import random
 from pathlib import Path
@@ -25,6 +26,11 @@ import torch
 import numpy as np
 from PIL import Image
 from torchvision import transforms
+
+# ── Plotting ──────────────────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use("Agg")  # headless-safe backend
+import matplotlib.pyplot as plt
 
 # ── HuggingFace ecosystem ─────────────────────────────────────────────────────
 from diffusers import (
@@ -73,6 +79,8 @@ class Config:
     processed_dir: str = "data/processed"
     captions_file: str = "data/captions.json"
     output_dir: str = "outputs"
+    charts_dir: str = "outputs/charts"
+    training_log: str = "outputs/training_log.csv"
     model_dir: str = "models/lora_checkpoint"
 
     # ── Base model ────────────────────────────────────────────────────────────
@@ -536,6 +544,13 @@ class LoRATrainer:
         print(f"Starting LoRA training for {cfg.max_train_steps} steps "
               f"(weight_dtype={weight_dtype})…\n")
 
+        # ── Training log: per-step loss + lr written to CSV for plotting ──────
+        log_path = Path(cfg.training_log)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_path, "w", newline="")
+        log_writer = csv.writer(log_file)
+        log_writer.writerow(["step", "loss", "lr"])
+
         for epoch in range(9999):  # breaks on max_train_steps
             for batch in dataloader:
                 with self.accelerator.accumulate(unet):
@@ -571,7 +586,13 @@ class LoRATrainer:
                     optimizer.zero_grad()
 
                 global_step += 1
+
+                # Log every step to CSV (cheap), print every 50
+                log_writer.writerow([
+                    global_step, float(loss.item()), float(lr_scheduler.get_last_lr()[0])
+                ])
                 if global_step % 50 == 0:
+                    log_file.flush()  # ensure data hits disk in case of crash
                     print(f"  step {global_step:>5} / {cfg.max_train_steps}  loss={loss.item():.4f}")
 
                 if global_step % cfg.save_steps == 0:
@@ -587,7 +608,9 @@ class LoRATrainer:
         # Final save
         Path(cfg.model_dir).mkdir(parents=True, exist_ok=True)
         self.accelerator.unwrap_model(unet).save_pretrained(cfg.model_dir)
+        log_file.close()
         print(f"\n✓ LoRA training complete. Weights → {cfg.model_dir}")
+        print(f"  Training log → {log_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -753,16 +776,363 @@ class DogEvaluator:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STAGE 7 — CHART GENERATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ChartGenerator:
+    """
+    Produces three PNG outputs for the project report:
+
+      1. loss_curve.png        — training loss vs. step (with smoothed overlay)
+      2. per_breed_table.png   — sorted table of FID/CLIP per breed
+      3. baseline_vs_finetuned.png — bar chart comparing base SD vs fine-tuned
+
+    All charts are saved under cfg.charts_dir.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        Path(cfg.charts_dir).mkdir(parents=True, exist_ok=True)
+        # Consistent typography across all charts
+        plt.rcParams.update({
+            "font.size": 10,
+            "axes.titlesize": 13,
+            "axes.labelsize": 11,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "figure.dpi": 120,
+        })
+
+    # ── 1. Training loss curve ────────────────────────────────────────────────
+    def plot_loss_curve(self, log_path: Optional[str] = None) -> str:
+        log_path = Path(log_path or self.cfg.training_log)
+        if not log_path.exists():
+            print(f"⚠ {log_path} not found — run training first")
+            return ""
+
+        steps, losses, lrs = [], [], []
+        with open(log_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                steps.append(int(row["step"]))
+                losses.append(float(row["loss"]))
+                lrs.append(float(row["lr"]))
+
+        if not steps:
+            print(f"⚠ {log_path} is empty")
+            return ""
+
+        # Exponential moving average for the smoothed line
+        ema, alpha = [], 0.05
+        running = losses[0]
+        for v in losses:
+            running = alpha * v + (1 - alpha) * running
+            ema.append(running)
+
+        fig, ax1 = plt.subplots(figsize=(9, 5))
+        ax1.plot(steps, losses, color="#9bb7d4", linewidth=0.6, alpha=0.5,
+                 label="raw loss")
+        ax1.plot(steps, ema, color="#1f4e79", linewidth=2.0,
+                 label="loss (EMA, α=0.05)")
+        ax1.set_xlabel("Training step")
+        ax1.set_ylabel("MSE loss (noise prediction)")
+        ax1.set_title("LoRA fine-tuning — training loss")
+        ax1.grid(True, linestyle=":", alpha=0.4)
+
+        # Secondary axis for learning rate
+        ax2 = ax1.twinx()
+        ax2.plot(steps, lrs, color="#c47b3a", linewidth=1.3,
+                 linestyle="--", label="learning rate")
+        ax2.set_ylabel("Learning rate", color="#c47b3a")
+        ax2.tick_params(axis="y", labelcolor="#c47b3a")
+        ax2.spines["top"].set_visible(False)
+
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+
+        out = Path(self.cfg.charts_dir) / "loss_curve.png"
+        fig.tight_layout()
+        fig.savefig(out, bbox_inches="tight")
+        plt.close(fig)
+        print(f"✓ Loss curve → {out}")
+        return str(out)
+
+    # ── 2. Per-breed evaluation table ─────────────────────────────────────────
+    def plot_per_breed_table(self, per_breed_results: list[dict],
+                             top_n: int = 25) -> str:
+        """
+        Renders a sorted table (best → worst FID) as a PNG.
+
+        per_breed_results: list of dicts with keys
+            'breed', 'fid', 'clip_score', 'n_samples'
+        """
+        if not per_breed_results:
+            print("⚠ No per-breed results to plot")
+            return ""
+
+        # Sort by FID ascending (lower = better realism)
+        rows = sorted(per_breed_results, key=lambda r: r.get("fid", float("inf")))
+        if top_n:
+            rows = rows[:top_n]
+
+        col_labels = ["Rank", "Breed", "FID ↓", "CLIP ↑", "n samples"]
+        cell_text = [
+            [str(i + 1),
+             r["breed"],
+             f"{r.get('fid', 0):.2f}",
+             f"{r.get('clip_score', 0):.3f}",
+             str(r.get("n_samples", "—"))]
+            for i, r in enumerate(rows)
+        ]
+
+        # Sized to comfortably show top_n rows
+        fig_height = max(3, 0.32 * (len(rows) + 2))
+        fig, ax = plt.subplots(figsize=(8, fig_height))
+        ax.axis("off")
+
+        tbl = ax.table(
+            cellText=cell_text,
+            colLabels=col_labels,
+            loc="center",
+            cellLoc="center",
+            colWidths=[0.08, 0.42, 0.13, 0.15, 0.15],
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1, 1.35)
+
+        # Header styling
+        for i, _ in enumerate(col_labels):
+            cell = tbl[(0, i)]
+            cell.set_facecolor("#1f4e79")
+            cell.set_text_props(color="white", weight="bold")
+
+        # Alternating row shading
+        for r in range(1, len(rows) + 1):
+            color = "#f4f6f9" if r % 2 == 0 else "white"
+            for c in range(len(col_labels)):
+                tbl[(r, c)].set_facecolor(color)
+
+        ax.set_title(f"Per-breed evaluation (top {len(rows)} by FID)",
+                     pad=14, weight="bold")
+
+        out = Path(self.cfg.charts_dir) / "per_breed_table.png"
+        fig.savefig(out, bbox_inches="tight")
+        plt.close(fig)
+        print(f"✓ Per-breed table → {out}")
+
+        # Also save a sortable bar chart of FID per breed (more visual)
+        self._plot_per_breed_bars(rows)
+        return str(out)
+
+    def _plot_per_breed_bars(self, rows: list[dict]) -> str:
+        breeds = [r["breed"] for r in rows]
+        fids = [r.get("fid", 0) for r in rows]
+        clips = [r.get("clip_score", 0) for r in rows]
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, max(5, 0.25 * len(rows))))
+
+        # FID bars
+        ax1.barh(breeds, fids, color="#1f4e79")
+        ax1.set_xlabel("FID (lower is better)")
+        ax1.set_title("FID per breed")
+        ax1.invert_yaxis()
+        ax1.grid(True, axis="x", linestyle=":", alpha=0.4)
+
+        # CLIP bars
+        ax2.barh(breeds, clips, color="#c47b3a")
+        ax2.set_xlabel("CLIP score (higher is better)")
+        ax2.set_title("CLIP score per breed")
+        ax2.invert_yaxis()
+        ax2.grid(True, axis="x", linestyle=":", alpha=0.4)
+
+        out = Path(self.cfg.charts_dir) / "per_breed_bars.png"
+        fig.tight_layout()
+        fig.savefig(out, bbox_inches="tight")
+        plt.close(fig)
+        print(f"✓ Per-breed bar chart → {out}")
+        return str(out)
+
+    # ── 3. Baseline vs fine-tuned comparison ──────────────────────────────────
+    def plot_baseline_vs_finetuned(self, comparison: dict) -> str:
+        """
+        comparison dict shape:
+          {
+            "breeds": ["Golden Retriever", "Husky", ...],
+            "baseline":  {"fid": [...], "clip": [...]},
+            "finetuned": {"fid": [...], "clip": [...]},
+          }
+        """
+        breeds = comparison["breeds"]
+        x = np.arange(len(breeds))
+        width = 0.38
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
+
+        # FID comparison (lower better)
+        ax1.bar(x - width/2, comparison["baseline"]["fid"], width,
+                label="Base SD v1.5", color="#9bb7d4")
+        ax1.bar(x + width/2, comparison["finetuned"]["fid"], width,
+                label="LoRA fine-tuned", color="#1f4e79")
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(breeds, rotation=35, ha="right")
+        ax1.set_ylabel("FID (lower is better)")
+        ax1.set_title("FID: baseline vs fine-tuned")
+        ax1.legend()
+        ax1.grid(True, axis="y", linestyle=":", alpha=0.4)
+
+        # CLIP comparison (higher better)
+        ax2.bar(x - width/2, comparison["baseline"]["clip"], width,
+                label="Base SD v1.5", color="#e6c79c")
+        ax2.bar(x + width/2, comparison["finetuned"]["clip"], width,
+                label="LoRA fine-tuned", color="#c47b3a")
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(breeds, rotation=35, ha="right")
+        ax2.set_ylabel("CLIP score (higher is better)")
+        ax2.set_title("CLIP score: baseline vs fine-tuned")
+        ax2.legend()
+        ax2.grid(True, axis="y", linestyle=":", alpha=0.4)
+
+        out = Path(self.cfg.charts_dir) / "baseline_vs_finetuned.png"
+        fig.tight_layout()
+        fig.savefig(out, bbox_inches="tight")
+        plt.close(fig)
+        print(f"✓ Baseline comparison → {out}")
+        return str(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 8 — MULTI-BREED EVALUATION + BASELINE COMPARISON
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_multiple_breeds(cfg: Config, breeds: list, manifest: list,
+                              num_per_breed: int = 8,
+                              compare_baseline: bool = False) -> dict:
+    """
+    For each breed in `breeds`:
+      • generate `num_per_breed` images with the LoRA-fine-tuned model
+      • optionally also generate from the base model (no LoRA)
+      • compute FID + CLIP against real images of that breed
+
+    Returns a dict with per-breed results and (optionally) comparison data
+    suitable for ChartGenerator.plot_baseline_vs_finetuned.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    evaluator = DogEvaluator(cfg, device=device)
+
+    # Build a breed → list of real image paths index from the manifest
+    breed_to_paths = {}
+    for r in manifest:
+        breed_to_paths.setdefault(r["breed"], []).append(r["path"])
+
+    finetuned_results = []
+    baseline_results = []
+
+    # ── Fine-tuned generation pass ────────────────────────────────────────────
+    print("\n=== Generating from LoRA fine-tuned model ===")
+    ft_generator = DogImageGenerator(cfg, use_controlnet=False)
+    for breed in breeds:
+        if breed not in breed_to_paths:
+            print(f"  ⚠ {breed} not in manifest — skipping")
+            continue
+        print(f"  → {breed}")
+        images = ft_generator.generate(breed=breed, num_images=num_per_breed)
+        out_dir = Path(cfg.output_dir) / "eval" / "finetuned" / breed.replace(" ", "_")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        gen_paths = []
+        for i, img in enumerate(images):
+            p = out_dir / f"gen_{i:03d}.png"
+            img.save(p)
+            gen_paths.append(str(p))
+
+        # Reset FID counters between breeds — torchmetrics accumulates state
+        evaluator.fid.reset()
+        real_paths = breed_to_paths[breed][:cfg.fid_num_samples]
+        fid = evaluator.compute_fid(real_paths, gen_paths)
+        prompt = DogImageGenerator.PROMPT_TEMPLATE.format(breed=breed)
+        clip = evaluator.compute_clip_score(gen_paths, [prompt] * len(gen_paths))
+        finetuned_results.append({
+            "breed": breed, "fid": fid, "clip_score": clip,
+            "n_samples": len(gen_paths),
+        })
+
+    del ft_generator
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    # ── Baseline generation pass (skip LoRA loading entirely) ─────────────────
+    if compare_baseline:
+        print("\n=== Generating from base SD v1.5 (no LoRA) ===")
+        # Temporarily point model_dir at a non-existent path so __init__ skips loading
+        original_model_dir = cfg.model_dir
+        cfg.model_dir = "/tmp/__no_such_lora_dir__"
+        base_generator = DogImageGenerator(cfg, use_controlnet=False)
+        cfg.model_dir = original_model_dir
+
+        for breed in breeds:
+            if breed not in breed_to_paths:
+                continue
+            print(f"  → {breed}")
+            images = base_generator.generate(breed=breed, num_images=num_per_breed)
+            out_dir = Path(cfg.output_dir) / "eval" / "baseline" / breed.replace(" ", "_")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            gen_paths = []
+            for i, img in enumerate(images):
+                p = out_dir / f"gen_{i:03d}.png"
+                img.save(p)
+                gen_paths.append(str(p))
+
+            evaluator.fid.reset()
+            real_paths = breed_to_paths[breed][:cfg.fid_num_samples]
+            fid = evaluator.compute_fid(real_paths, gen_paths)
+            prompt = DogImageGenerator.PROMPT_TEMPLATE.format(breed=breed)
+            clip = evaluator.compute_clip_score(gen_paths, [prompt] * len(gen_paths))
+            baseline_results.append({
+                "breed": breed, "fid": fid, "clip_score": clip,
+                "n_samples": len(gen_paths),
+            })
+
+        del base_generator
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    # ── Persist + return ──────────────────────────────────────────────────────
+    output = {
+        "finetuned": finetuned_results,
+        "baseline": baseline_results,
+    }
+    results_path = Path(cfg.output_dir) / "multi_breed_results.json"
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(results_path, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\n✓ Multi-breed results → {results_path}")
+    return output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI ENTRYPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(description="Generative Dog Images Pipeline")
-    p.add_argument("--stage", choices=["preprocess", "caption", "train", "generate", "evaluate"], required=True)
-    p.add_argument("--breed", type=str, default="Golden Retriever", help="Breed for generation/evaluation")
+    p.add_argument("--stage", choices=[
+        "preprocess", "caption", "train", "generate", "evaluate",
+        "compare", "charts",
+    ], required=True)
+    p.add_argument("--breed", type=str, default="Golden Retriever",
+                   help="Breed for generation/evaluation")
+    p.add_argument("--breeds", type=str, nargs="+",
+                   default=["Golden Retriever", "Siberian Husky",
+                            "Chihuahua", "Beagle", "Border Collie"],
+                   help="List of breeds for compare/charts stages")
     p.add_argument("--num_images", type=int, default=4)
+    p.add_argument("--num_per_breed", type=int, default=8,
+                   help="Images per breed during multi-breed evaluation")
     p.add_argument("--use_controlnet", action="store_true")
-    p.add_argument("--caption_limit", type=int, default=None, help="Limit captioning to N images (for testing)")
+    p.add_argument("--caption_limit", type=int, default=None,
+                   help="Limit captioning to N images (for testing)")
     return p.parse_args()
 
 
@@ -823,6 +1193,53 @@ def main():
         )
         print("\nFinal Results:")
         print(json.dumps(results, indent=2))
+
+    elif args.stage == "compare":
+        # Run multi-breed evaluation against both fine-tuned and baseline models
+        manifest_path = Path(cfg.processed_dir) / "manifest.json"
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        evaluate_multiple_breeds(
+            cfg, breeds=args.breeds, manifest=manifest,
+            num_per_breed=args.num_per_breed, compare_baseline=True,
+        )
+        print("\nNext step: run `--stage charts` to render the PNG outputs.")
+
+    elif args.stage == "charts":
+        charter = ChartGenerator(cfg)
+
+        # 1. Loss curve from training_log.csv
+        charter.plot_loss_curve()
+
+        # 2 & 3 — depend on multi_breed_results.json from --stage compare
+        results_path = Path(cfg.output_dir) / "multi_breed_results.json"
+        if results_path.exists():
+            with open(results_path) as f:
+                data = json.load(f)
+            ft = data.get("finetuned", [])
+            base = data.get("baseline", [])
+
+            if ft:
+                charter.plot_per_breed_table(ft, top_n=25)
+
+            if ft and base:
+                # Align breeds present in both runs
+                ft_map = {r["breed"]: r for r in ft}
+                base_map = {r["breed"]: r for r in base}
+                shared = [b for b in ft_map if b in base_map]
+                comparison = {
+                    "breeds": shared,
+                    "baseline":  {"fid":  [base_map[b]["fid"] for b in shared],
+                                   "clip": [base_map[b]["clip_score"] for b in shared]},
+                    "finetuned": {"fid":  [ft_map[b]["fid"] for b in shared],
+                                   "clip": [ft_map[b]["clip_score"] for b in shared]},
+                }
+                charter.plot_baseline_vs_finetuned(comparison)
+        else:
+            print(f"⚠ {results_path} not found — run `--stage compare` first "
+                  "to populate multi-breed evaluation data.")
+
+        print(f"\n✓ All charts saved under {cfg.charts_dir}/")
 
 
 if __name__ == "__main__":
