@@ -630,13 +630,27 @@ class DogImageGenerator:
                 cfg.base_model_id, torch_dtype=torch.float16
             ).to(device)
 
-        # Load LoRA weights if available
+        # Load LoRA weights if available.
+        # The trainer saves with PEFT (adapter_model.safetensors + adapter_config.json),
+        # so we load the same way rather than via the legacy load_attn_procs() path
+        # which would expect pytorch_lora_weights.bin.
         lora_path = Path(cfg.model_dir)
-        if lora_path.exists():
-            self.pipe.unet.load_attn_procs(str(lora_path))
-            print(f"  LoRA weights loaded from {lora_path}")
+        adapter_file = lora_path / "adapter_model.safetensors"
+        legacy_file = lora_path / "pytorch_lora_weights.safetensors"
+
+        if adapter_file.exists():
+            from peft import PeftModel
+            self.pipe.unet = PeftModel.from_pretrained(
+                self.pipe.unet, str(lora_path)
+            ).to(device)
+            print(f"  ✓ LoRA adapter (PEFT) loaded from {lora_path}")
+        elif legacy_file.exists():
+            # Fallback for checkpoints saved in the older diffusers format
+            self.pipe.load_lora_weights(str(lora_path))
+            print(f"  ✓ LoRA weights (legacy) loaded from {lora_path}")
         else:
-            print("  ⚠ No LoRA checkpoint found — using base model")
+            print(f"  ⚠ No LoRA checkpoint found in {lora_path} — using base model")
+            print(f"     (looked for adapter_model.safetensors or pytorch_lora_weights.safetensors)")
 
         self.pipe.enable_attention_slicing()
         self.use_controlnet = use_controlnet
