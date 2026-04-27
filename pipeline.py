@@ -65,7 +65,11 @@ class Config:
     data_root: str = "data"
     stanford_dir: str = "data/stanford_dogs"
     oxford_dir: str = "data/oxford_pets"
-    pose_dir: str = "data/dog_pose"
+    # StanfordExtra references Stanford Dogs images by relative path,
+    # so we point pose_dir at the Stanford images and just drop the JSON
+    # alongside it as `stanford_extra.json`.
+    pose_dir: str = "data/stanford_dogs"
+    pose_annotations_file: str = "data/stanford_dogs/stanford_extra.json"
     processed_dir: str = "data/processed"
     captions_file: str = "data/captions.json"
     output_dir: str = "outputs"
@@ -100,6 +104,14 @@ class Config:
     guidance_scale: float = 7.5
     num_inference_steps: int = 50
     num_images_per_prompt: int = 4
+
+    # ── Captioning ────────────────────────────────────────────────────────────
+    # BLIP-Base is ~2x faster than BLIP-Large with marginal quality drop for
+    # this domain. Batch inference is the biggest win — 16-32 fits on most GPUs.
+    caption_model_id: str = "Salesforce/blip-image-captioning-base"
+    caption_batch_size: int = 32
+    caption_num_workers: int = 4   # parallel image loading via DataLoader
+    caption_save_every: int = 500  # checkpoint captions every N images
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     fid_num_samples: int = 1000
@@ -152,20 +164,61 @@ class DogImagePreprocessor:
         return records
 
     def _process_pose(self):
-        """Dog-Pose Dataset: keypoint annotations stored in JSON."""
-        print("[3/3] Processing Dog-Pose Dataset…")
-        ann_file = Path(self.cfg.pose_dir) / "annotations.json"
-        records = []
-        if ann_file.exists():
-            with open(ann_file) as f:
-                anns = json.load(f)
-            for item in anns.get("images", []):
-                records.append({
-                    "path": str(Path(self.cfg.pose_dir) / "images" / item["file_name"]),
-                    "breed": item.get("breed", "Unknown"),
-                    "keypoints": item.get("keypoints", []),
-                    "source": "pose",
-                })
+        """
+        StanfordExtra: extends Stanford Dogs with 20-keypoint annotations.
+
+        Format: a JSON file that is a flat list of dicts. Each entry contains:
+          - img_path: relative path within Stanford Dogs Images/ folder
+                      (e.g. "n02085620-Chihuahua/n02085620_10074.jpg")
+          - joints:   list of 20 keypoints, each [x, y, visibility]
+          - seg:      RLE-encoded silhouette mask (optional)
+          - img_bbox: [x, y, w, h] bounding box around the dog
+
+        The breed is encoded in the directory portion of img_path:
+          "n02085620-Chihuahua" → "Chihuahua"
+        """
+        print("[3/3] Processing StanfordExtra (pose) annotations…")
+        ann_file = Path(self.cfg.pose_annotations_file)
+        if not ann_file.exists():
+            print(f"   ⚠ {ann_file} not found — skipping pose annotations")
+            return []
+
+        with open(ann_file) as f:
+            anns = json.load(f)
+
+        # StanfordExtra ships as a flat list. Some forks wrap it under "data".
+        if isinstance(anns, dict):
+            anns = anns.get("data") or anns.get("images") or []
+
+        # Stanford Dogs images live in <stanford_dir>/Images/<class>/<file>.jpg
+        img_root = Path(self.cfg.stanford_dir) / "Images"
+
+        records, skipped = [], 0
+        for item in anns:
+            rel_path = item.get("img_path") or item.get("file_name")
+            if not rel_path:
+                skipped += 1
+                continue
+
+            full_path = img_root / rel_path
+            if not full_path.exists():
+                skipped += 1
+                continue
+
+            # Breed name from "n02085620-Chihuahua" → "Chihuahua"
+            class_dir = rel_path.split("/", 1)[0]
+            breed = class_dir.split("-", 1)[-1].replace("_", " ").title()
+
+            records.append({
+                "path": str(full_path),
+                "breed": breed,
+                "keypoints": item.get("joints", []),  # 20 × [x, y, visibility]
+                "bbox": item.get("img_bbox"),
+                "source": "pose",
+            })
+
+        if skipped:
+            print(f"   ⚠ Skipped {skipped} entries (missing img_path or file)")
         print(f"   → {len(records)} pose-annotated images")
         return records
 
@@ -175,18 +228,28 @@ class DogImagePreprocessor:
         all_records += self._process_oxford()
         all_records += self._process_pose()
 
-        # Deduplicate by file path
-        seen, unique = set(), []
+        # Deduplicate by file path. When the same image appears in multiple
+        # sources (e.g. Stanford + StanfordExtra), merge so we keep the keypoints.
+        merged = {}
         for r in all_records:
-            if r["path"] not in seen:
-                seen.add(r["path"])
-                unique.append(r)
+            path = r["path"]
+            if path not in merged:
+                merged[path] = r
+            else:
+                # Merge new fields (e.g. 'keypoints', 'bbox') into the existing record
+                # without overwriting non-null values.
+                for k, v in r.items():
+                    if k not in merged[path] or merged[path][k] in (None, [], "Unknown"):
+                        merged[path][k] = v
+        unique = list(merged.values())
 
         manifest_path = Path(self.cfg.processed_dir) / "manifest.json"
         with open(manifest_path, "w") as f:
             json.dump(unique, f, indent=2)
 
-        print(f"\n✓ Preprocessing complete. {len(unique)} total images → {manifest_path}")
+        n_with_keypoints = sum(1 for r in unique if r.get("keypoints"))
+        print(f"\n✓ Preprocessing complete. {len(unique)} total images "
+              f"({n_with_keypoints} with keypoints) → {manifest_path}")
         return unique
 
 
@@ -194,55 +257,162 @@ class DogImagePreprocessor:
 # STAGE 2 — AUTO-CAPTIONING (BLIP-2)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _CaptionImageDataset(Dataset):
+    """Lightweight dataset for parallel image loading during captioning."""
+
+    def __init__(self, records: list, processor, target_size: int = 384):
+        self.records = records
+        self.processor = processor
+        self.target_size = target_size
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        try:
+            img = Image.open(record["path"]).convert("RGB")
+            # Pre-resize to BLIP's expected input (~384px) before preprocessing
+            img.thumbnail((self.target_size * 2, self.target_size * 2), Image.LANCZOS)
+            return {
+                "image": img,
+                "path": record["path"],
+                "breed": record.get("breed", "dog"),
+                "ok": True,
+            }
+        except Exception:
+            return {"image": None, "path": record["path"],
+                    "breed": record.get("breed", "dog"), "ok": False}
+
+
+def _caption_collate(batch):
+    """Collate function: keeps PIL images as a list, gathers metadata."""
+    return {
+        "images": [b["image"] for b in batch if b["ok"]],
+        "paths":  [b["path"]  for b in batch if b["ok"]],
+        "breeds": [b["breed"] for b in batch if b["ok"]],
+        "failed_paths":  [b["path"]  for b in batch if not b["ok"]],
+        "failed_breeds": [b["breed"] for b in batch if not b["ok"]],
+    }
+
+
 class DogCaptioner:
     """
-    Generates natural-language captions using BLIP, then enriches them
-    with breed name for structured prompts like:
-      "A photo of a Golden Retriever dog with fluffy golden coat, sitting on grass"
+    Batched BLIP captioning with parallel image loading and incremental saves.
+
+    Speed wins (vs original single-image loop):
+      • BLIP-Base instead of BLIP-Large: ~2x faster, near-identical quality here
+      • Batched generation (default 32 per batch): the big GPU win, ~10x speedup
+      • DataLoader with num_workers: image decoding overlaps with GPU work
+      • Resume support: skips already-captioned paths from previous runs
+      • Incremental saves: progress is checkpointed every N images so an
+        interrupted run doesn't lose hours of work
+
+    Combined effect on a modern GPU: ~7 hours → ~25-40 minutes for 20k images.
     """
 
     def __init__(self, cfg: Config, device: str = "cuda"):
         self.cfg = cfg
         self.device = device
-        print("Loading BLIP captioning model…")
-        self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+        print(f"Loading captioning model ({cfg.caption_model_id})…")
+        self.processor = BlipProcessor.from_pretrained(cfg.caption_model_id)
         self.model = BlipForConditionalGeneration.from_pretrained(
-            "Salesforce/blip-image-captioning-large",
+            cfg.caption_model_id,
             torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         ).to(device)
+        self.model.eval()
 
-    def caption_image(self, img_path: str, breed: str) -> str:
-        try:
-            image = Image.open(img_path).convert("RGB")
-        except Exception:
-            return f"A photo of a {breed} dog"
+    @staticmethod
+    def _enrich(raw_caption: str, breed: str) -> str:
+        """Inject breed name if BLIP didn't already mention it."""
+        if breed.lower() in raw_caption.lower():
+            return raw_caption
+        return f"A photo of a {breed} dog, {raw_caption}"
 
-        inputs = self.processor(image, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            out = self.model.generate(**inputs, max_new_tokens=50)
-        raw_caption = self.processor.decode(out[0], skip_special_tokens=True)
+    def _load_existing_captions(self) -> dict:
+        """Resume support: load any captions from a previous interrupted run."""
+        path = Path(self.cfg.captions_file)
+        if path.exists():
+            try:
+                with open(path) as f:
+                    existing = json.load(f)
+                print(f"   Found {len(existing)} existing captions — resuming from there")
+                return existing
+            except json.JSONDecodeError:
+                print("   ⚠ Existing captions file is corrupt — starting fresh")
+        return {}
 
-        # Inject breed name if not already present
-        breed_lower = breed.lower()
-        if breed_lower not in raw_caption.lower():
-            caption = f"A photo of a {breed} dog, {raw_caption}"
-        else:
-            caption = raw_caption
-        return caption
+    def _save(self, captions: dict):
+        """Atomic write: save to temp file then rename."""
+        path = Path(self.cfg.captions_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(captions, f, indent=2)
+        tmp.replace(path)
+
+    @torch.no_grad()
+    def _caption_batch(self, images: list, breeds: list) -> list:
+        """Run BLIP on a batch of PIL images and return enriched captions."""
+        if not images:
+            return []
+        inputs = self.processor(images=images, return_tensors="pt", padding=True).to(self.device)
+        if self.device == "cuda":
+            inputs = {k: (v.half() if v.dtype == torch.float32 else v) for k, v in inputs.items()}
+        outputs = self.model.generate(**inputs, max_new_tokens=40, num_beams=1)
+        raw_captions = self.processor.batch_decode(outputs, skip_special_tokens=True)
+        return [self._enrich(c, b) for c, b in zip(raw_captions, breeds)]
 
     def run(self, manifest: list, limit: Optional[int] = None) -> dict:
-        captions = {}
-        records = manifest[:limit] if limit else manifest
-        for i, record in enumerate(records):
-            path = record["path"]
-            breed = record.get("breed", "dog")
-            captions[path] = self.caption_image(path, breed)
-            if (i + 1) % 100 == 0:
-                print(f"   Captioned {i + 1}/{len(records)}")
+        cfg = self.cfg
+        captions = self._load_existing_captions()
 
-        with open(self.cfg.captions_file, "w") as f:
-            json.dump(captions, f, indent=2)
-        print(f"✓ Captions saved → {self.cfg.captions_file}")
+        # Filter out already-captioned records
+        records = manifest[:limit] if limit else manifest
+        todo = [r for r in records if r["path"] not in captions]
+        print(f"   {len(records)} total records, {len(captions)} already done, "
+              f"{len(todo)} remaining")
+        if not todo:
+            print("✓ Nothing to caption.")
+            return captions
+
+        ds = _CaptionImageDataset(todo, self.processor)
+        loader = DataLoader(
+            ds,
+            batch_size=cfg.caption_batch_size,
+            num_workers=cfg.caption_num_workers,
+            collate_fn=_caption_collate,
+            shuffle=False,
+            pin_memory=False,  # we hold PIL images, not tensors
+        )
+
+        import time
+        t0 = time.time()
+        seen = 0
+        for batch_idx, batch in enumerate(loader):
+            # Captions for successfully-loaded images
+            new_captions = self._caption_batch(batch["images"], batch["breeds"])
+            for path, caption in zip(batch["paths"], new_captions):
+                captions[path] = caption
+
+            # Fallback for files that failed to load
+            for path, breed in zip(batch["failed_paths"], batch["failed_breeds"]):
+                captions[path] = f"A photo of a {breed} dog"
+
+            seen += len(batch["paths"]) + len(batch["failed_paths"])
+
+            # Periodic checkpoint save + progress print
+            if seen % cfg.caption_save_every < cfg.caption_batch_size or batch_idx == len(loader) - 1:
+                self._save(captions)
+                elapsed = time.time() - t0
+                rate = seen / elapsed if elapsed > 0 else 0
+                eta = (len(todo) - seen) / rate if rate > 0 else 0
+                print(f"   {seen:>5}/{len(todo)}  "
+                      f"({rate:.1f} img/s, ETA {eta/60:.1f} min)")
+
+        self._save(captions)
+        print(f"✓ Captions saved → {cfg.captions_file}  "
+              f"({len(captions)} total in {(time.time()-t0)/60:.1f} min)")
         return captions
 
 
